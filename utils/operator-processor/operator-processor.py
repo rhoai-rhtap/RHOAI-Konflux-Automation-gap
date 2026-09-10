@@ -1,4 +1,6 @@
 import sys
+import hashlib
+import subprocess
 from datetime import datetime
 from pathlib import Path
 from ruamel.yaml.comments import CommentedMap
@@ -199,7 +201,137 @@ def str_presenter(dumper, data):
 
 
 BASE_URL = 'https://quay.io/api/v1'
-class quay_controller:
+REGISTRY = os.environ.get('QUAY_REGISTRY', 'quay.io')
+MANIFEST_LIST_MEDIA_TYPES = frozenset({
+    'application/vnd.docker.distribution.manifest.list.v2+json',
+    'application/vnd.oci.image.index.v1+json',
+})
+# skopeo stderr fragments that mean "this tag/manifest does not exist", as
+# opposed to "we could not authenticate" or "the registry is down".  Only the
+# former may be reported as an empty result; anything else has to be fatal, or
+# an expired credential would masquerade as a missing image.
+_NOT_FOUND_MARKERS = (
+    'manifest unknown',
+    'was deleted or has expired',
+    'name unknown',
+    'repository name not known',
+)
+
+
+def quay_controller(org: str):
+    """Return the registry client selected by QUAY_BACKEND (default skopeo).
+
+    'skopeo' talks to the /v2/ registry API, which accepts the robot-account
+    pull secret.  'api' talks to /api/v1, which only accepts a Quay OAuth
+    application token.  Both satisfy the same contract, so the processor does
+    not care which one it gets.
+    """
+    backend = os.environ.get('QUAY_BACKEND', 'skopeo').lower()
+    if backend == 'skopeo':
+        return quay_skopeo_controller(org)
+    if backend == 'api':
+        return quay_api_controller(org)
+    print(f'Unsupported QUAY_BACKEND "{backend}", expected "skopeo" or "api"')
+    sys.exit(1)
+
+
+class quay_skopeo_controller:
+    """/v2/ registry-API implementation of the quay_controller contract.
+
+    Method signatures and return shapes match quay_api_controller exactly, so
+    operator_processor is unchanged.
+
+    Two behaviours differ from the /api/v1 implementation, both because the
+    registry API exposes no tag history:
+
+      * get_all_tags returns at most one entry - the manifest the tag points
+        at right now.  The REST version passes onlyActiveTags=false and gets
+        the tag's full history, so if the newest push is not signed yet it can
+        fall back to an older signed revision of the same tag.  Here an
+        unsigned tip means the component is reported missing instead.
+      * expired tags are invisible.
+    """
+
+    def __init__(self, org: str):
+        self.org = org
+        # Keyed by full docker:// reference.  get_all_tags already fetches the
+        # index that get_image_manifest_digests_for_all_the_supported_archs is
+        # about to ask for again, so this saves one network round trip per
+        # multi-arch component.
+        self._raw_cache = {}
+
+    def _ref(self, repo, ref):
+        separator = '@' if ref.startswith('sha256:') else ':'
+        return f'docker://{REGISTRY}/{self.org}/{repo}{separator}{ref}'
+
+    def _inspect(self, args, image_ref, missing_ok=False):
+        command = ['skopeo', 'inspect', '--retry-times', '3'] + args + [image_ref]
+        result = subprocess.run(command, capture_output=True)
+        if result.returncode == 0:
+            return result.stdout
+        stderr = result.stderr.decode('utf-8', 'replace').strip()
+        if missing_ok and any(marker in stderr for marker in _NOT_FOUND_MARKERS):
+            return None
+        print(f'skopeo inspect failed for {image_ref}: {stderr}')
+        sys.exit(1)
+
+    def _raw_manifest(self, repo, ref, missing_ok=False):
+        image_ref = self._ref(repo, ref)
+        if image_ref not in self._raw_cache:
+            self._raw_cache[image_ref] = self._inspect(['--raw'], image_ref, missing_ok)
+        return self._raw_cache[image_ref]
+
+    def get_tag_details(self, repo, tag):
+        raw = self._raw_manifest(repo, tag, missing_ok=True)
+        if raw is None:
+            return {}
+        return {'manifest_digest': self._digest(raw)}
+
+    def get_all_tags(self, repo, tag):
+        raw = self._raw_manifest(repo, tag, missing_ok=True)
+        if raw is None:
+            return []
+        manifest = json.loads(raw)
+        digest = self._digest(raw)
+        # Cache under the digest too: the caller resolves the multi-arch index
+        # by digest next, and it is the same content we just downloaded.
+        self._raw_cache[self._ref(repo, digest)] = raw
+        return [{
+            'manifest_digest': digest,
+            'is_manifest_list': manifest.get('mediaType') in MANIFEST_LIST_MEDIA_TYPES,
+        }]
+
+    @staticmethod
+    def _digest(raw_manifest: bytes):
+        # The manifest digest is the sha256 of the manifest bytes exactly as
+        # served; skopeo --raw writes them through unmodified.
+        return f'sha256:{hashlib.sha256(raw_manifest).hexdigest()}'
+
+    def get_supported_archs(self, repo, manifest_digest):
+        manifest = json.loads(self._raw_manifest(repo, manifest_digest))
+        if manifest.get('mediaType') not in MANIFEST_LIST_MEDIA_TYPES:
+            return []
+        return [f'{entry["platform"]["os"]}-{entry["platform"]["architecture"]}'
+                for entry in manifest.get('manifests', [])]
+
+    def get_image_manifest_digests_for_all_the_supported_archs(self, repo, manifest_digest):
+        manifest = json.loads(self._raw_manifest(repo, manifest_digest))
+        if manifest.get('mediaType') not in MANIFEST_LIST_MEDIA_TYPES:
+            return []
+        # Deliberately unfiltered, matching the REST implementation: the caller
+        # takes [0], so filtering here would change which manifest the git
+        # labels are read from.
+        return [entry['digest'] for entry in manifest.get('manifests', [])]
+
+    def get_git_labels(self, repo, tag):
+        # Config-blob labels, so this needs the resolved single-arch image
+        # rather than --raw.
+        config = json.loads(self._inspect([], self._ref(repo, tag)))
+        return [{'key': key, 'value': value}
+                for key, value in (config.get('Labels') or {}).items()]
+
+
+class quay_api_controller:
     def __init__(self, org:str):
         self.org = org
     def get_tag_details(self, repo, tag):

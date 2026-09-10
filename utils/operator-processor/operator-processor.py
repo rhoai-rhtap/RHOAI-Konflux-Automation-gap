@@ -325,8 +325,11 @@ class quay_skopeo_controller:
 
     def get_git_labels(self, repo, tag):
         # Config-blob labels, so this needs the resolved single-arch image
-        # rather than --raw.
-        config = json.loads(self._inspect([], self._ref(repo, tag)))
+        # rather than --raw.  --no-tags is essential, not cosmetic: without it
+        # skopeo also enumerates every tag in the repository to fill RepoTags,
+        # which costs minutes on the busier component repos and is discarded
+        # here anyway.
+        config = json.loads(self._inspect(['--no-tags'], self._ref(repo, tag)))
         return [{'key': key, 'value': value}
                 for key, value in (config.get('Labels') or {}).items()]
 

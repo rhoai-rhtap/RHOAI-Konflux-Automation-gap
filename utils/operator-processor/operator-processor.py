@@ -37,7 +37,14 @@ class operator_processor:
                                              preserve_quotes=True)
         self.push_pipeline_operation = push_pipeline_operation
         self.push_pipeline_yaml_path = push_pipeline_yaml_path
-        self.push_pipeline_dict = ruyaml.load(open(self.push_pipeline_yaml_path), Loader=ruyaml.RoundTripLoader, preserve_quotes=True)
+        # --push-pipeline-yaml-path is declared required=False, so honour that and
+        # load it only when one was supplied.  Early-gate runs process an ephemeral
+        # branch that is deleted as soon as the build finishes: there is no release
+        # push pipeline for them to enable, and the branch may not carry one at all.
+        # Opening it eagerly here failed the whole run on a file it never needed.
+        self.push_pipeline_dict = None
+        if self.push_pipeline_yaml_path:
+            self.push_pipeline_dict = ruyaml.load(open(self.push_pipeline_yaml_path), Loader=ruyaml.RoundTripLoader, preserve_quotes=True)
 
     def parse_patch_yaml(self):
         return yaml.safe_load(open(self.patch_yaml_path))
@@ -58,6 +65,10 @@ class operator_processor:
 
 
     def process_push_pipeline(self):
+        if self.push_pipeline_dict is None:
+            print('No push pipeline supplied - skipping the enable/disable toggle')
+            return
+
         current_on_cel_expr = self.push_pipeline_dict['metadata']['annotations']['pipelinesascode.tekton.dev/on-cel-expression']
         disable_ext = 'non-existent-file.non-existent-ext'
         disable_expr = f'"{disable_ext}".pathChanged() && '
